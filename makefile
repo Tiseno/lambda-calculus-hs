@@ -3,3 +3,5 @@ default:
 
 build:
 	ghc main.hs -o lc
+	rm main.hi
+	rm main.o

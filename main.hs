@@ -1,10 +1,18 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use newtype instead of data" #-}
 {-# HLINT ignore "Use lambda-case" #-}
-import           Control.Applicative (Alternative (..))
-import qualified Control.Monad.State as State
-import qualified Data.Char           as Char
-import qualified Data.Set            as Set
+import           Control.Applicative      (Alternative (..))
+import qualified Control.Monad            as Monad
+import           Control.Monad.IO.Class   (MonadIO)
+import qualified Control.Monad.IO.Class   as MonadIO
+import           Control.Monad.State      (State)
+import qualified Control.Monad.State      as State
+import qualified Data.Char                as Char
+import qualified Data.Set                 as Set
+import qualified System.Environment       as Environment
+import qualified System.IO                as SystemIO
+
+import qualified System.Console.Haskeline as HL
 
 data Parser a = Parser { runParser :: String -> Maybe (String, a) }
 
@@ -48,7 +56,7 @@ parseVar = parseText <|> parseNumber
 parseSpace = many $ parsePred Char.isSpace
 
 parseVarTerm = Var <$> parseVar
-parseAbsBody = Abs <$> (parseSingle 'λ' *> parseSpace *> parseVar) <*> (parseSpace *> parseSingle '.' *> parseSpace *> parseTerm)
+parseAbsBody = Abs <$> ((parseSingle 'λ' <|> parseSingle '\\' <|> parseSingle '/') *> parseSpace *> parseVar) <*> (parseSpace *> parseSingle '.' *> parseSpace *> parseTerm)
 parseAppBody = App <$> parseTerm <*> (parseSpace *> parseTerm)
 parseAbsOrApp = parseSingle '(' *> parseSpace *> (parseAbsBody <|> parseAppBody) <* parseSpace <* parseSingle ')'
 parseTerm = parseSpace *> (parseVarTerm <|> parseAbsOrApp)
@@ -95,13 +103,13 @@ rename t@((Abs x m)) from to
 rename ((App m n)) from to =
   App (rename m from to) (rename n from to)
 
-newVar :: State.State Int Var
+newVar :: State Int Var
 newVar = do
   n <- State.get
   State.put $ n + 1
   pure $ Number n
 
-renameBound :: Set.Set Var -> Term -> State.State Int Term
+renameBound :: Set.Set Var -> Term -> State Int Term
 renameBound free t@(Var _) = pure t
 renameBound free t@((Abs x m)) = do
   (x', m') <- if x `Set.member` free
@@ -123,13 +131,13 @@ replaceVarWithTerm t@((Abs x m)) from to
 replaceVarWithTerm ((App m n)) from to =
   App (replaceVarWithTerm m from to) (replaceVarWithTerm n from to)
 
-betaReduction :: (Var, Term) -> Term -> State.State Int Term
+betaReduction :: (Var, Term) -> Term -> State Int Term
 betaReduction (x, m) n = do
   let free = freeVariables n
   m' <- renameBound free m
   pure $ replaceVarWithTerm m' x n
 
-reduce :: Term -> State.State Int Term
+reduce :: Term -> State Int Term
 reduce t@(Var _) = pure t
 reduce t@((Abs x m)) = do
   m' <- reduce m
@@ -140,27 +148,83 @@ reduce t@((App (Abs x m) n)) = do
 reduce t@((App m n)) = do
   n' <- reduce n
   m' <- reduce m
-  if m' == m
-     then pure (App m' n')
-     else reduce (App m' n')
+  pure (App m' n')
 
-reduceIO :: Term -> IO Term
-reduceIO = reduceIOr 1 0
+reduceIO :: MonadIO m => Maybe Int -> Term -> m Term
+reduceIO maxDepth t = reduceIO' 0 (t, 1)
   where
-    reduceIOr :: Int -> Int -> Term -> IO Term
-    reduceIOr i n t = do
+    reduceIO' n (t, i) = do
       let (t', i') = State.runState (reduce t) i
-      if t' == t
+       in if t' == t || maybe False (n >=) maxDepth
          then pure t
          else do
-           putStrLn $ "  -> " ++ show t'
-           reduceIOr i' (n + 1) t'
+           MonadIO.liftIO $ print t
+           reduceIO' (n + 1) (t', i')
 
-main :: IO ()
-main = case parseFullTerm "((λf.((λx.(f (x x))) (λx.(f (x x))))) g)" of
-  Left e -> putStrLn $ "Error: " ++ e
-  Right e -> do
-    print e
-    r <- reduceIO e
-    print r
-    pure ()
+eval :: MonadIO m => Maybe Int -> String -> m ()
+eval maxDepth s =
+  case parseFullTerm s of
+    Left e  -> MonadIO.liftIO $ putStrLn $ "Error: " ++ e
+    Right e -> do
+      t <- reduceIO maxDepth e
+      MonadIO.liftIO $ print t
+
+exampleHelp :: String
+exampleHelp =
+  "\n\
+  \  A lambda expression is on one of the following forms:\n\
+  \\n\
+  \  1. x       A variable\n\
+  \  2. (λx.M)  A lambda abstraction (function definition), taking a parameter x, returning the lambda expression M\n\
+  \  3. (M N)   An application of an expression M to the expression N\n\
+  \\n\
+  \  \\ or / can be used instead of λ\n\
+  \\n\
+  \  An expression is evaluated by repeated β-reduction (function application) until it is irreducible\n\
+  \\n\
+  \Example\n\
+  \  > ((\\z.(z (o i))) (\\g.g))\n\
+  \  ((λz.(z (o i))) (λg.g))\n\
+  \  ((λg.g) (o i))\n\
+  \  (o i)\n"
+
+repl :: HL.InputT IO ()
+repl = do
+  input <- HL.handleInterrupt (pure Nothing) (HL.getInputLine "> ")
+  case input of
+    Nothing -> pure ()
+    Just ":q" -> pure ()
+    Just ":h" -> do
+      HL.outputStrLn exampleHelp
+      repl
+    Just [] -> repl
+    Just s -> do
+      eval Nothing s
+      repl
+
+cliHelp :: String
+cliHelp =
+  "Evaluator of lambda calculus expressions\n\
+  \\n\
+  \Usage  lc              Enter into a repl\n\
+  \       lc [EXPR]       Evaluate a lambda expression\n\
+  \       ... | lc        Evaluate a lambda expression from stdin\n\
+  \       lc -y           Evaluate the y combinator applied to g: ((λf.((λx.(f (x x))) (λx.(f (x x))))) g)\n\
+  \                       and exit after 20 reductions\n\
+  \\n" ++ exampleHelp
+
+main = do
+  isInputTerminal <- SystemIO.hIsTerminalDevice SystemIO.stdin
+  args <- Environment.getArgs
+  case () of
+    _ | "-h" `elem` args || "-help" `elem` args || "--help" `elem` args -> putStr cliHelp
+    _ | "-y" `elem` args -> eval (Just 20) "((λf.((λx.(f (x x))) (λx.(f (x x))))) g)"
+    _ | isInputTerminal && null args -> if null args
+          then do
+            putStrLn "Entering repl. :h for help, :q to exit"
+            HL.runInputT HL.defaultSettings $ HL.withInterrupt repl
+          else eval Nothing (unwords args)
+    _ -> do
+      s <- SystemIO.getContents
+      eval Nothing s
+
